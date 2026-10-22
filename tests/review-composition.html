@@ -1,0 +1,17 @@
+<!doctype html><meta charset="utf-8"><title>Diagnóstico de consistência da prévia</title>
+<pre id="results">Executando…</pre>
+<script type="module">
+import {ImageUtils} from '/src/services/ImageUtils.ts';
+const out=document.getElementById('results');
+async function image(color,mask=false){const c=document.createElement('canvas');c.width=c.height=128;const x=c.getContext('2d');x.fillStyle=color;x.fillRect(mask?16:0,mask?16:0,mask?96:128,mask?96:128);return new Promise(r=>c.toBlob(r,'image/png'));}
+async function canvas(blob){const b=await createImageBitmap(blob);const c=document.createElement('canvas');c.width=b.width;c.height=b.height;c.getContext('2d').drawImage(b,0,0);b.close();return c;}
+try{
+ const base=await image('rgb(100,120,140)'), edit=await image('rgb(140,160,180)');
+ const mask=await ImageUtils.featherMask(await image('white',true),24);
+ const preview=await canvas(await ImageUtils.compositeInpaint(base,edit,mask,true));
+ const actual=await canvas(base);const layer=await canvas(await ImageUtils.inpaintLayer(edit,mask,base));actual.getContext('2d').drawImage(layer,0,0);
+ const a=preview.getContext('2d').getImageData(64,64,1,1).data;
+ const b=actual.getContext('2d').getImageData(64,64,1,1).data;
+ out.textContent='Fluxo atual do App.tsx, com a mesma imagem e máscara:\nPrévia no centro: '+[...a]+'\nCamada composta no centro: '+[...b]+'\n'+(a.every((v,i)=>v===b[i])?'PASS: resultados coincidem':'FAIL: prévia e camada inserida diferem.');
+}catch(e){out.textContent='ERROR: '+e.message;}
+</script>

@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <title>Teste de Inpainting Multi-Cenários no Photopea</title>
+  <style>
+    body { background: #1e1e24; color: #f0f0f0; font-family: system-ui, -apple-system, sans-serif; margin: 0; padding: 20px; }
+    h1 { font-size: 20px; margin-top: 0; color: #4ade80; }
+    .controls { display: flex; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; align-items: center; }
+    button { background: #3b82f6; color: white; border: none; padding: 8px 14px; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 13px; }
+    button:hover { background: #2563eb; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-green { background: #10b981; }
+    .btn-green:hover { background: #059669; }
+    .btn-purple { background: #8b5cf6; }
+    .btn-purple:hover { background: #7c3aed; }
+    .btn-orange { background: #f97316; }
+    .btn-orange:hover { background: #ea580c; }
+    #log { background: #111; color: #00ff88; padding: 12px; border-radius: 6px; font-family: monospace; font-size: 13px; min-height: 110px; max-height: 230px; overflow-y: auto; white-space: pre-wrap; margin-bottom: 16px; border: 1px solid #333; }
+    .container { display: flex; gap: 20px; }
+    iframe { width: 980px; height: 680px; border: 1px solid #444; border-radius: 8px; background: #000; }
+    .preview-box { width: 360px; display: flex; flex-direction: column; gap: 10px; }
+    .preview-box img { width: 100%; border-radius: 6px; border: 1px solid #555; background: #222; }
+  </style>
+</head>
+<body>
+  <h1>Teste e Validação: Inpainting em Múltiplos Objetos e Cenários</h1>
+  <div class="controls">
+    <label>Token Hugging Face (somente nesta aba): <input id="hf-token" type="password" autocomplete="off" placeholder="hf_…"></label>
+
+    <button id="btn-case1" class="btn-purple">▶ Caso 1: Maçã na Mesa ➔ Caneca de Café</button>
+    <button id="btn-case2" class="btn-orange">▶ Caso 2: Câmera na Mesa ➔ Planta Suculenta</button>
+    <button id="btn-auto" class="btn-green">▶ Caso 0: Caneca Vermelha ➔ Maçã Verde</button>
+  </div>
+
+  <pre id="log">Inicializando Photopea e ponte de integração…</pre>
+
+  <div class="container">
+    <iframe id="photopea" title="Photopea Sandbox"></iframe>
+    <div class="preview-box">
+      <h3>Resultado Composto Exportado</h3>
+      <img id="result-img" alt="Resultado de Inpainting aparecerá aqui">
+      <a id="download-result" hidden download="inpaint-result.png">Baixar resultado PNG</a>
+      <div id="status-tag" style="font-size: 12px; color: #aaa;">Aguardando execução…</div>
+    </div>
+  </div>
+
+  <script type="module">
+    import { PhotopeaBridge } from '/src/core/PhotopeaBridge.ts';
+    import { ImageUtils } from '/src/services/ImageUtils.ts';
+    import { FreeInpaintProvider } from '/src/providers/FreeInpaintProvider.ts';
+    import { KeyVault } from '/src/services/KeyVault.ts';
+
+    const logEl = document.getElementById('log');
+    const iframe = document.getElementById('photopea');
+    const resultImg = document.getElementById('result-img');
+    const statusTag = document.getElementById('status-tag');
+    const btnCase1 = document.getElementById('btn-case1');
+    const btnCase2 = document.getElementById('btn-case2');
+    const btnAuto = document.getElementById('btn-auto');
+
+    function log(msg) {
+      logEl.textContent += '\n' + msg;
+      logEl.scrollTop = logEl.scrollHeight;
+      console.log(msg);
+    }
+
+    let bridge = null;
+    let photopeaReady = false;
+
+    window.addEventListener('message', async (event) => {
+      if (photopeaReady || event.source !== iframe.contentWindow || !['https://www.photopea.com', 'https://photopea.com'].includes(event.origin)) return;
+      if (event.data === 'ai-ready' || event.data === 'done') {
+        photopeaReady = true;
+        bridge = PhotopeaBridge.forEmbeddedPhotopea(iframe.contentWindow);
+        log('✔ Photopea conectado com sucesso via postMessage.');
+        log('Pronto. Escolha um dos cenários acima para executar.');
+      }
+    });
+
+    async function executeScenario({ name, imagePath, selectionCoords, prompt, negativePrompt, layerName }) {
+      btnCase1.disabled = true;
+      btnCase2.disabled = true;
+      btnAuto.disabled = true;
+      statusTag.textContent = `Executando: ${name}...`;
+
+      try {
+        log(`\n========================================`);
+        log(`INICIANDO: ${name}`);
+        log(`1. Carregando imagem base (${imagePath}) no Photopea...`);
+        // Fecha documentos anteriores para isolamento total do teste
+        await bridge.runScript('while (app.documents.length > 0) { app.activeDocument.close(SaveOptions.DONOTSAVECHANGES); } app.echoToOE("cleaned");');
+        const resp = await fetch(imagePath);
+        if (!resp.ok) throw new Error('Imagem base indisponível: HTTP '+resp.status);
+        const buffer = await resp.arrayBuffer();
+        await bridge.runScript(buffer);
+        // Garante que o documento recém-aberto é o documento ativo
+        await bridge.runScript('if (app.documents.length > 0) app.activeDocument = app.documents[app.documents.length - 1]; app.echoToOE("doc_active");');
+        log(`✔ Imagem carregada como documento ativo no Photopea.`);
+
+        log(`2. Criando seleção no elemento com contexto e sombra de apoio...`);
+        const selScript = `
+          var doc = app.activeDocument;
+          doc.selection.select(${JSON.stringify(selectionCoords)});
+        `;
+        await bridge.runScript(selScript);
+        const docInfo = await bridge.getDocumentInfo();
+        log(`✔ Seleção criada. Documento: ${docInfo.width}x${docInfo.height}, Seleção ativa: ${docInfo.hasSelection}`);
+
+        log(`3. Exportando imagem base e máscara da seleção...`);
+        const baseBuffer = await bridge.exportActiveDocumentPNG();
+        const maskBuffer = await bridge.exportSelectionMask();
+        if (!baseBuffer || !maskBuffer) throw new Error('Falha ao exportar buffers do Photopea');
+        log(`✔ Exportado do Photopea: Base ${baseBuffer.byteLength} bytes, Máscara ${maskBuffer.byteLength} bytes.`);
+
+        const baseBlob = new Blob([baseBuffer], { type: 'image/png' });
+        const maskBlob = new Blob([maskBuffer], { type: 'image/png' });
+
+        const token = document.getElementById('hf-token').value.trim() || KeyVault.getKey('free_inpaint') || undefined;
+        log(`4. Enviando recorte com contexto para SDXL Inpainting (Hugging Face ZeroGPU)...`);
+        log(`   Prompt: "${prompt}"`);
+
+        const provider = new FreeInpaintProvider();
+        const result = await provider.inpaint({
+          prompt,
+          negativePrompt,
+          model: 'diffusers-sdxl-inpaint',
+          width: 1024,
+          height: 1024,
+          steps: 24,
+          cfgScale: 7.5,
+          referenceImage: baseBlob,
+          maskImage: maskBlob,
+          onProgress: (msg) => log('   [SDXL Progresso]: ' + msg)
+        }, token);
+
+        log(`✔ IA gerou a substituição com sucesso!`);
+
+        log(`5. Aplicando suavização interna (featherMask 24px) e harmonização de cor de fundo...`);
+        const compositeMask = await ImageUtils.featherMask(maskBlob, 24);
+        const layerBlob = await ImageUtils.inpaintLayer(result.imageBlob, compositeMask, baseBlob);
+        const layerBuffer = await layerBlob.arrayBuffer();
+
+        log(`6. Inserindo nova camada transparente "${layerName}" no Photopea...`);
+        const currentDoc = await bridge.getDocumentInfo();
+        await bridge.insertImageAsLayer(layerBuffer, layerName, currentDoc.source);
+        log(`✔ Camada inserida no Photopea com sucesso!`);
+
+        log(`7. Exportando resultado composto final renderizado pelo Photopea...`);
+        const mergedBuffer = await bridge.exportActiveDocumentPNG();
+        const mergedBlob = new Blob([mergedBuffer], { type: 'image/png' });
+        const readPixels = async blob => {
+          const bitmap=await createImageBitmap(blob), canvas=document.createElement('canvas');
+          canvas.width=bitmap.width;canvas.height=bitmap.height;
+          const ctx=canvas.getContext('2d');ctx.drawImage(bitmap,0,0);bitmap.close();
+          return ctx.getImageData(0,0,canvas.width,canvas.height).data;
+        };
+        const expectedPreview = await ImageUtils.compositeLayer(baseBlob, layerBlob);
+        const [before, after, mask, preview] = await Promise.all([baseBlob, mergedBlob, maskBlob, expectedPreview].map(readPixels));
+        let external=0, maxPreviewDifference=0;
+        for(let i=0;i<before.length;i+=4) for(let c=0;c<4;c++) {
+          if(mask[i+3]===0 && before[i+c]!==after[i+c]) external++;
+          maxPreviewDifference=Math.max(maxPreviewDifference,Math.abs(preview[i+c]-after[i+c]));
+        }
+        if(external) throw new Error('Pixels externos alterados: '+external);
+        if(maxPreviewDifference>2) throw new Error('Prévia diverge do Photopea: '+maxPreviewDifference);
+        log('✔ Zero diferenças fora da seleção; diferença máxima prévia/Photopea: '+maxPreviewDifference+'/255.');
+        const oldURL=resultImg.getAttribute('src');if(oldURL?.startsWith('blob:')) URL.revokeObjectURL(oldURL);
+        const url = URL.createObjectURL(mergedBlob);
+        const download=document.getElementById('download-result');download.href=url;download.hidden=false;
+        resultImg.src = url;
+        statusTag.textContent = `✔ Concluído com sucesso: ${name}!`;
+        log(`🎉 SUCESSO: ${name} concluído. Confira o acabamento visual.`);
+
+        window.__LAST_SCENARIO_RESULT__ = {
+          name,
+          success: true,
+          dataUrl: await ImageUtils.blobToDataURL(mergedBlob)
+        };
+
+      } catch (err) {
+        log(`❌ ERRO no cenário ${name}: ` + err.message);
+        statusTag.textContent = 'Erro: ' + err.message;
+        window.__LAST_SCENARIO_RESULT__ = {
+          name,
+          success: false,
+          error: err.message
+        };
+      } finally {
+        btnCase1.disabled = false;
+        btnCase2.disabled = false;
+        btnAuto.disabled = false;
+      }
+    }
+
+    // Cenário 1: Maçã na Mesa -> Caneca de Café com Vapor
+    btnCase1.onclick = () => executeScenario({
+      name: 'Caso 1: Maçã na Mesa ➔ Caneca de Café',
+      imagePath: '/case1-apple.png',
+      selectionCoords: [[260, 360], [740, 360], [740, 870], [260, 870]],
+      prompt: 'a cozy ceramic coffee mug filled with coffee, resting firmly on the wooden table with soft contact shadow, warm morning window lighting, photorealistic, sharp focus',
+      negativePrompt: 'apple, fruit, red, blurry, distorted, poorly drawn, lowres',
+      layerName: 'AI: Caneca de Café'
+    });
+
+    // Cenário 2: Câmera na Mesa -> Planta Suculenta em Vaso
+    btnCase2.onclick = () => executeScenario({
+      name: 'Caso 2: Câmera na Mesa ➔ Planta Suculenta',
+      imagePath: '/case2-camera.png',
+      selectionCoords: [[220, 330], [800, 330], [800, 860], [220, 860]],
+      prompt: 'a single green echeveria succulent growing in a plain round terracotta flowerpot, simple smooth orange clay pot, upright on the wooden desk, realistic contact shadow, warm soft side lighting, photorealistic',
+      negativePrompt: 'camera, lens, lens cap, circles on the side, handles, spout, blue pot, metal, electronics, blurry, distorted, lowres',
+      layerName: 'AI: Planta Suculenta'
+    });
+
+    // Cenário 0: Caneca Vermelha -> Maçã Verde
+    btnAuto.onclick = () => executeScenario({
+      name: 'Caso 0: Caneca ➔ Maçã Verde',
+      imagePath: '/test-mug.png',
+      selectionCoords: [[150, 440], [300, 440], [300, 580], [150, 580]],
+      prompt: 'a ripe fresh green granny smith apple sitting on a table, studio lighting, photorealistic, high quality',
+      negativePrompt: 'blurry, ugly, distorted, low quality, mug, red, cup',
+      layerName: 'AI: Maçã Verde'
+    });
+
+    // Inicializa Photopea com o plugin AI Studio
+    const pluginUrl = new URL('/', location.href).href;
+    const pluginIcon = new URL('/icon.svg', location.href).href;
+    const config = {
+      environment: {
+        plugins: [
+          { name: "AI Studio", url: pluginUrl, icon: pluginIcon }
+        ]
+      },
+      script: 'app.echoToOE("ai-ready");'
+    };
+    iframe.src = 'https://www.photopea.com/#' + encodeURIComponent(JSON.stringify(config));
+    log('Aguardando inicialização do Photopea...');
+  </script>
+</body>
+</html>

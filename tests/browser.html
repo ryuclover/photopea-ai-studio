@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="pt-BR"><meta charset="utf-8"><title>AI Studio — testes de imagem</title>
+<style>body{background:#202124;color:#eee;font:16px system-ui;padding:30px}pre{white-space:pre-wrap}img{width:220px}</style>
+<h1>Testes de imagem no navegador</h1><pre id="results">Executando…</pre>
+<button id="network">Testar SDXL público com imagem sintética</button><pre id="network-result"></pre><img id="network-image" alt="Resultado do teste de IA" hidden>
+<script type="module">
+import {ImageUtils} from '/src/services/ImageUtils.ts';
+import {FreeInpaintProvider} from '/src/providers/FreeInpaintProvider.ts';
+const output = document.getElementById('results');
+const checks = [];
+const assert = (condition, name) => { if (!condition) throw new Error(name); checks.push('PASS: ' + name); };
+async function fixture(color, masked = false) {
+  const canvas = document.createElement('canvas'); canvas.width=4; canvas.height=2;
+  const ctx=canvas.getContext('2d'); ctx.fillStyle=color;
+  ctx.fillRect(0,0,masked ? 2 : 4,2);
+  return await new Promise(resolve=>canvas.toBlob(resolve,'image/png'));
+}
+async function pixels(blob) {
+  const bitmap=await createImageBitmap(blob);
+  const canvas=document.createElement('canvas');canvas.width=bitmap.width;canvas.height=bitmap.height;
+  const ctx=canvas.getContext('2d');ctx.drawImage(bitmap,0,0);bitmap.close();
+  return ctx.getImageData(0,0,canvas.width,canvas.height).data;
+}
+try {
+  const original=await fixture('rgb(20,80,140)');
+  const edit=await fixture('red'); const mask=await fixture('white',true);
+  const result=await pixels(await ImageUtils.compositeInpaint(original,edit,mask));
+  const base=await pixels(original);
+  assert(result[0]===255 && result[1]===0,'área selecionada recebe a edição');
+  assert(result.slice(8,16).every((value,index)=>value===base[index+8]),'pixels fora da seleção são idênticos ao original');
+  const patch=await pixels(await ImageUtils.inpaintLayer(edit,mask));
+  assert(patch[3]===255 && patch[11]===0,'nova camada tem transparência fora da seleção');
+  const inverted=await pixels(await ImageUtils.prepareOpenAIMask(mask,4,2));
+  assert(inverted[3]===0 && inverted[11]===255,'máscara da OpenAI inverte a seleção corretamente');
+  const resized=await ImageUtils.resizeImageBlob(original,8,4);
+  const dimensions=await ImageUtils.getImageDimensions(resized);
+  assert(dimensions.width===8 && dimensions.height===4,'redimensionamento retorna as dimensões pedidas');
+  // Recorte com contexto
+  const inside=(r,b,W,H)=>r.x>=0&&r.y>=0&&r.x+r.width<=W&&r.y+r.height<=H&&r.x<=b.x&&r.y<=b.y&&r.x+r.width>=b.x+b.width&&r.y+r.height>=b.y+b.height;
+  const cases=[[{x:900,y:10,width:100,height:60},1024,1024],[{x:0,y:0,width:2000,height:300},2400,800],[{x:50,y:1500,width:80,height:400},600,2000],[{x:5,y:5,width:12,height:12},64,48],[{x:0,y:0,width:1024,height:1024},1024,1024]];
+  for (const [b,W,H] of cases) {
+    const c=ImageUtils.planInpaintCrop(b,W,H);
+    if(!inside(c.rect,b,W,H)) throw new Error('recorte fora do documento ou sem a seleção: '+JSON.stringify([b,W,H,c]));
+    if(c.targetWidth%8||c.targetHeight%8) throw new Error('dimensões do modelo não múltiplas de 8: '+JSON.stringify(c));
+  }
+  assert(true,'recorte contém a seleção, respeita bordas e documentos largos/altos/pequenos');
+  const small=ImageUtils.planInpaintCrop({x:500,y:500,width:40,height:40},2048,2048);
+  assert(small.rect.width>=512 && small.targetWidth<=1024*1.01,'seleção pequena recebe contexto mínimo e ampliação limitada');
+  // Documento sintético 64x48 com gradiente e seleção 20..40 x 10..30
+  const doc=document.createElement('canvas');doc.width=64;doc.height=48;const dctx=doc.getContext('2d');
+  for(let x=0;x<64;x++){dctx.fillStyle=`rgb(${x*4},${100+x},${200-x*2})`;dctx.fillRect(x,0,1,48);}
+  const docBlob=await new Promise(r=>doc.toBlob(r,'image/png'));
+  dctx.clearRect(0,0,64,48);dctx.fillStyle='white';dctx.fillRect(20,10,20,20);
+  const selBlob=await new Promise(r=>doc.toBlob(r,'image/png'));
+  const sb=await ImageUtils.selectionBounds(selBlob);
+  assert(sb.bounds.x===20&&sb.bounds.y===10&&sb.bounds.width===20&&sb.bounds.height===20&&sb.width===64,'limites da seleção calculados no tamanho do documento');
+  const rect={x:10,y:4,width:40,height:36};
+  const cropped=await ImageUtils.cropScaled(selBlob,rect,80,72,true);
+  const cp=await pixels(cropped);
+  const at=(d,w,x,y)=>d[(y*w+x)*4+3];
+  assert(at(cp,80,(30-10)*2,(20-4)*2)===255&&at(cp,80,2,2)===0,'máscara recortada e binarizada na posição escalada');
+  const red=document.createElement('canvas');red.width=80;red.height=72;const rctx=red.getContext('2d');rctx.fillStyle='red';rctx.fillRect(0,0,80,72);
+  const pasted=await pixels(await ImageUtils.pasteCrop(docBlob,await new Promise(r=>red.toBlob(r,'image/png')),rect));
+  const orig=await pixels(docBlob);
+  let outsideSame=true;for(let y=0;y<48;y++)for(let x=0;x<64;x++){const inCrop=x>=10&&x<50&&y>=4&&y<40;const i=(y*64+x)*4;if(!inCrop&&(pasted[i]!==orig[i]||pasted[i+1]!==orig[i+1]||pasted[i+2]!==orig[i+2]))outsideSame=false;}
+  assert(outsideSame&&pasted[(20*64+30)*4]===255&&pasted[(20*64+30)*4+1]===0,'resultado volta na posição do recorte; fora dele o original é mantido');
+  // Suavização interna
+  const fm=await pixels(await ImageUtils.featherMask(selBlob,8));
+  let outsideZero=true;for(let y=0;y<48;y++)for(let x=0;x<64;x++){const sel=x>=20&&x<40&&y>=10&&y<30;if(!sel&&fm[(y*64+x)*4+3]!==0)outsideZero=false;}
+  assert(outsideZero,'suavização não vaza para fora da seleção');
+  const comp=await pixels(await ImageUtils.compositeInpaint(docBlob,await ImageUtils.pasteCrop(docBlob,await new Promise(r=>red.toBlob(r,'image/png')),rect),await ImageUtils.featherMask(selBlob,8)));
+  let compOutside=true;for(let y=0;y<48;y++)for(let x=0;x<64;x++){const sel=x>=20&&x<40&&y>=10&&y<30;const i=(y*64+x)*4;if(!sel&&(comp[i]!==orig[i]||comp[i+1]!==orig[i+1]||comp[i+2]!==orig[i+2]||comp[i+3]!==orig[i+3]))compOutside=false;}
+  assert(compOutside&&comp[(20*64+30)*4]===255,'composição suavizada: zero diferenças RGBA fora da seleção');
+  const full=document.createElement('canvas');full.width=16;full.height=16;const fctx=full.getContext('2d');fctx.fillStyle='white';fctx.fillRect(0,0,16,16);
+  const fullMask=await pixels(await ImageUtils.featherMask(await new Promise(r=>full.toBlob(r,'image/png')),8));
+  assert(fullMask[3]===255&&fullMask[(8*16+8)*4+3]===255,'bordas do documento não são tratadas como borda da seleção');
+  // Regression: one processed layer must drive both preview and insertion.
+  const big=document.createElement('canvas');big.width=big.height=128;const bx=big.getContext('2d');
+  const bigBlob=async(color,selection=false)=>{bx.clearRect(0,0,128,128);bx.fillStyle=color;bx.fillRect(selection?16:0,selection?16:0,selection?96:128,selection?96:128);return new Promise(r=>big.toBlob(r,'image/png'));};
+  const bb=await bigBlob('rgb(100,120,140)'),ee=await bigBlob('rgb(140,160,180)');
+  const mm=await ImageUtils.featherMask(await bigBlob('white',true),24);
+  const ll=await ImageUtils.inpaintLayer(ee,mm,bb);
+  const pp=await pixels(await ImageUtils.compositeLayer(bb,ll));
+  const expected=await pixels(await ImageUtils.compositeInpaint(bb,ee,mm,true));
+  assert(pp.every((v,i)=>v===expected[i]),'prévia e camada usam exatamente a mesma composição harmonizada');
+  const center=(64*128+64)*4;
+  assert(pp[center]===140&&pp[center+1]===160&&pp[center+2]===180,'harmonização preserva a cor no interior opaco do objeto');
+  const noHarmony=await pixels(await ImageUtils.inpaintLayer(ee,mm));
+  const withHarmony=await pixels(ll);
+  assert(withHarmony[(64*128+20)*4]<noHarmony[(64*128+20)*4],'cor é ajustada somente na transição da borda');
+  let externalSame=true;const bp=await pixels(bb);
+  for(let y=0;y<128;y++)for(let x=0;x<128;x++)if(x<16||x>=112||y<16||y>=112){const i=(y*128+x)*4;for(let c=0;c<4;c++)if(pp[i+c]!==bp[i+c])externalSame=false;}
+  assert(externalSame,'composição harmonizada preserva todos os pixels externos');
+  bx.clearRect(0,0,128,128);bx.fillStyle='white';bx.beginPath();bx.arc(45,50,30,0,Math.PI*2);bx.fill();bx.fillRect(96,24,12,70);
+  bx.globalCompositeOperation='destination-out';bx.beginPath();bx.arc(45,50,10,0,Math.PI*2);bx.fill();bx.globalCompositeOperation='source-over';
+  const irregular=await new Promise(r=>big.toBlob(r,'image/png'));
+  const irrOriginal=await pixels(irregular),irrSoft=await ImageUtils.featherMask(irregular,12);
+  const irrPixels=await pixels(irrSoft),irrResult=await pixels(await ImageUtils.compositeInpaint(bb,ee,irrSoft,true));
+  let noLeak=true,originalOutside=true;
+  for(let i=0;i<irrPixels.length;i+=4)if(irrOriginal[i+3]===0){if(irrPixels[i+3]!==0)noLeak=false;for(let c=0;c<4;c++)if(irrResult[i+c]!==bp[i+c])originalOutside=false;}
+  assert(noLeak&&originalOutside,'seleções curvas, com buraco e regiões separadas preservam os pixels externos');
+  assert(irrPixels[(50*128+45)*4+3]===0,'buracos internos da seleção continuam transparentes');
+  output.textContent=checks.join('\n')+'\n\n'+checks.length+' testes passaram.';
+} catch(error) {output.textContent=checks.join('\n')+'\nFAIL: '+error.message;}
+document.getElementById('network').onclick=async()=>{
+  const status=document.getElementById('network-result');
+  const button=document.getElementById('network');button.disabled=true;
+  status.textContent='Processando somente imagem sintética…';
+  try {
+    const canvas=document.createElement('canvas');canvas.width=1024;canvas.height=1024;
+    const ctx=canvas.getContext('2d');ctx.fillStyle='rgb(80,140,180)';ctx.fillRect(0,0,1024,1024);
+    const base=await new Promise(resolve=>canvas.toBlob(resolve,'image/png'));
+    ctx.clearRect(0,0,1024,1024);ctx.fillStyle='white';ctx.fillRect(320,320,380,380);
+    const mask=await new Promise(resolve=>canvas.toBlob(resolve,'image/png'));
+    const result=await new FreeInpaintProvider().inpaint({prompt:'a red ceramic sphere on a blue background, product photography',model:'diffusers-sdxl-inpaint',width:1024,height:1024,steps:28,referenceImage:base,maskImage:mask});
+    const blob=await ImageUtils.compositeInpaint(base,result.imageBlob,mask);
+    const image=document.getElementById('network-image');image.src=URL.createObjectURL(blob);image.hidden=false;
+    status.textContent='PASS: upload, fila SSE, download e composição executados no navegador (CORS confirmado).';
+  }catch(error){status.textContent='FAIL: '+error.message;}finally{button.disabled=false;}
+};
+</script></html>

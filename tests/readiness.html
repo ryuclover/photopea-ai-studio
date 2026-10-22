@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="pt-BR"><meta charset="utf-8"><title>Auditoria de prontidão — AI Studio</title>
+<style>
+body{font:14px system-ui;background:#191b20;color:#eee;padding:20px;margin:0}button,input,select,a{font:inherit;padding:8px}button{cursor:pointer}pre{white-space:pre-wrap;background:#101216;padding:12px;max-height:300px;overflow:auto}iframe{width:960px;height:660px;border:1px solid #444}img{width:480px;max-width:100%}.row{display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap}.controls{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}label{display:flex;gap:8px;align-items:center}
+</style>
+<h1>Auditoria de prontidão</h1>
+<p>Usa apenas fixtures do projeto e documentos de teste. A conclusão técnica não aprova automaticamente a qualidade visual.</p>
+<div class="controls">
+<label>Token Hugging Face<input id="token" type="password" placeholder="hf_…" autocomplete="off"></label>
+<select id="scenario" aria-label="Cenário">
+<option value="replace">Substituição: maçã → caneca</option>
+<option value="remove">Remoção: mesa sem maçã</option>
+<option value="recolor">Cor: maçã verde</option>
+<option value="portrait">Retrato e seleção irregular: maçã → laranja</option>
+<option value="islands">Duas regiões separadas</option>
+<option value="text">Geração sem imagem original (paisagem)</option>
+</select>
+<button id="run" disabled>Executar cenário</button><button id="cancel" disabled>Cancelar</button>
+<button id="technical" disabled>Testar ponte e documentos</button>
+</div>
+<pre id="log">Carregando Photopea…</pre>
+<div class="row"><iframe id="photopea" title="Photopea de auditoria"></iframe><div><h2>Resultado</h2><img id="result" alt="Resultado da auditoria"><p id="summary"></p><a id="download" hidden download="readiness.png">Baixar PNG</a></div></div>
+<script type="module">
+import {PhotopeaBridge} from '/src/core/PhotopeaBridge.ts';
+import {ImageUtils} from '/src/services/ImageUtils.ts';
+import {FreeInpaintProvider} from '/src/providers/FreeInpaintProvider.ts';
+const $=id=>document.getElementById(id), output=$('log'), iframe=$('photopea');
+let bridge, controller, serial=0;
+const report=[];
+function log(s){output.textContent+='\n'+s;output.scrollTop=output.scrollHeight;}
+function assert(value,label){if(!value)throw new Error(label);log('PASS: '+label);}
+async function png(color,w=128,h=96){const c=document.createElement('canvas');c.width=w;c.height=h;const x=c.getContext('2d');x.fillStyle=color;x.fillRect(0,0,w,h);return new Promise(r=>c.toBlob(r,'image/png'));}
+async function pixels(blob){const b=await createImageBitmap(blob),c=document.createElement('canvas');c.width=b.width;c.height=b.height;const x=c.getContext('2d');x.drawImage(b,0,0);b.close();return x.getImageData(0,0,c.width,c.height).data;}
+async function activate(id){await bridge.runScript(`var found=false;for(var i=0;i<app.documents.length;i++){if(app.documents[i].source===${JSON.stringify(id)}){app.activeDocument=app.documents[i];found=true;break;}}if(!found)throw new Error("Documento de teste ausente");`);}
+async function open(blob){
+ const marker='ai-studio-document:readiness-'+Date.now()+'-'+(++serial)+'-';
+ const before=JSON.parse(await bridge.runScript(`var sources=[];for(var i=0;i<app.documents.length;i++){var d=app.documents[i];if(String(d.source).indexOf("ai-studio-document:")!==0)d.source=${JSON.stringify(marker)}+i+"|"+d.source;sources.push(d.source);}app.echoToOE(JSON.stringify(sources));`));
+ await bridge.runScript(await blob.arrayBuffer());
+ await bridge.runScript(`var found=0;for(var i=0;i<app.documents.length;i++){if(${JSON.stringify(before)}.indexOf(app.documents[i].source)===-1){app.activeDocument=app.documents[i];found++;}}if(found!==1)throw new Error("Importação da fixture ambígua");`);
+ return bridge.getDocumentInfo();
+}
+async function base(){const response=await fetch('/case1-apple.png');if(!response.ok)throw new Error('Fixture indisponível');return response.blob();}
+async function capture(){const info=await bridge.getDocumentInfo();const image=await bridge.exportActiveDocumentPNG();const mask=await bridge.exportSelectionMask();if(!image||!mask)throw new Error('Captura incompleta');return {info,base:new Blob([image],{type:'image/png'}),mask:new Blob([mask],{type:'image/png'})};}
+function busy(value){$('run').disabled=value;$('technical').disabled=value;$('cancel').disabled=!value;$('scenario').disabled=value;}
+window.addEventListener('message',event=>{if(bridge||event.source!==iframe.contentWindow||event.origin!=='https://www.photopea.com'||event.data!=='readiness-ready')return;bridge=PhotopeaBridge.forEmbeddedPhotopea(iframe.contentWindow);log('Photopea conectado.');busy(false);});
+iframe.src='https://www.photopea.com/#'+encodeURIComponent(JSON.stringify({script:'app.echoToOE("readiness-ready");'}));
+$('cancel').onclick=()=>controller?.abort(new Error('Cancelado pelo usuário.'));
+$('technical').onclick=async()=>{
+ busy(true);output.textContent='Teste técnico da ponte';
+ try{
+  const a=await open(await png('#5078a0'));
+  assert(!!a.id,'documento recebe identidade estável');
+  assert((await bridge.getDocumentInfo()).id===a.id,'identidade é mantida entre consultas');
+  const noMask=await bridge.exportSelectionMask();assert(noMask===null,'captura sem seleção não inventa máscara');
+  await bridge.runScript('app.activeDocument.selection.select([[10,10],[90,10],[90,70],[10,70]]);');
+  const fixture=await capture();
+  const feather=await ImageUtils.featherMask(fixture.mask,12);
+  const layer=await ImageUtils.inpaintLayer(await png('red'),feather,fixture.base);
+  const b=await open(await png('green'));
+  assert(a.id!==b.id,'documentos distintos têm identidades distintas');
+  let blocked=false;try{await bridge.insertImageAsLayer(await layer.arrayBuffer(),'wrong',a.id,{width:128,height:96});}catch{blocked=true;}
+  assert(blocked,'inserção bloqueada após trocar de documento');
+  await activate(a.id);
+  await bridge.insertImageAsLayer(await layer.arrayBuffer(),'Auditoria: edição',a.id,{width:128,height:96});
+  const merged=new Blob([await bridge.exportActiveDocumentPNG()],{type:'image/png'});
+  const expected=await pixels(await ImageUtils.compositeLayer(fixture.base,layer)),actual=await pixels(merged),mask=await pixels(fixture.mask),original=await pixels(fixture.base);
+  let external=0,max=0;
+  for(let i=0;i<actual.length;i+=4)for(let c=0;c<4;c++){if(mask[i+3]===0&&actual[i+c]!==original[i+c])external++;max=Math.max(max,Math.abs(actual[i+c]-expected[i+c]));}
+  assert(external===0,'inserção real preserva todos os pixels externos');
+  assert(max<=2,'prévia e Photopea concordam (arredondamento máximo 2/255)');
+  await activate(b.id);const other=await pixels(new Blob([await bridge.exportActiveDocumentPNG()],{type:'image/png'}));
+  assert(other[0]===0&&other[1]===128&&other[2]===0,'outro documento permanece intacto');
+  await activate(a.id);await bridge.runScript('app.activeDocument.resizeCanvas(160,96);');
+  blocked=false;try{await bridge.insertImageAsLayer(await layer.arrayBuffer(),'resized',a.id,{width:128,height:96});}catch{blocked=true;}
+  assert(blocked,'redimensionamento exige nova captura antes da inserção');
+  log('CONCLUÍDO: 9 verificações técnicas passaram.');
+ }catch(e){log('FAIL: '+e.message);}finally{busy(false);}
+};
+$('run').onclick=async()=>{
+ busy(true);controller=new AbortController();const name=$('scenario').value;output.textContent='Cenário: '+name;$('summary').textContent='Executando…';
+ const started=performance.now();
+ try{
+  const provider=new FreeInpaintProvider(),token=$('token').value.trim()||undefined;
+  let original,mask,info,prompt,negative='blurry, distorted, watermark, text, frame, border';
+  if(name!=='text'){
+   original=await base();
+   if(name==='portrait')original=await ImageUtils.cropScaled(original,{x:128,y:0,width:768,height:1024},768,1024);
+   info=await open(original);
+   const shape=name==='portrait'?[[130,360],[610,360],[650,650],[610,930],[130,930],[100,650]]:[[220,330],[810,330],[810,950],[220,950]];
+   await bridge.runScript(`app.activeDocument.selection.select(${JSON.stringify(shape)});`);
+   if(name==='islands')await bridge.runScript('app.activeDocument.selection.select([[40,40],[200,40],[200,180],[40,180]]);app.activeDocument.selection.select([[820,40],[980,40],[980,180],[820,180]],SelectionType.EXTEND);');
+   const captured=await capture();info=captured.info;original=captured.base;mask=captured.mask;
+  }
+  const prompts={
+   replace:'a single white ceramic coffee mug with one handle, resting on the wooden table, warm window light, realistic contact shadow, photorealistic',
+   remove:'an empty wooden tabletop with uninterrupted natural wood grain, no objects on the table, matching warm window lighting, photorealistic',
+   recolor:'a single fresh green Granny Smith apple, bright green apple skin, resting on the wooden table, warm window light, realistic contact shadow, photorealistic',
+   portrait:'a single ripe orange fruit resting on the wooden table, warm window light, realistic contact shadow, photorealistic',
+   islands:'soft warm bokeh background with green indoor plant leaves, natural window lighting, photorealistic',
+   text:'a small blue ceramic bowl on a wooden table, soft natural window light, photorealistic, clean composition'
+  };
+  prompt=prompts[name];if(name==='remove')negative+=', apple, fruit, cup, bowl, mug, object';
+  const params={prompt,negativePrompt:negative,model:'diffusers-sdxl-inpaint',width:name==='text'?1024:info.width,height:name==='text'?768:info.height,steps:24,cfgScale:7,signal:controller.signal,onProgress:log};
+  const result=name==='text'?await provider.generate(params,token):await provider.inpaint({...params,referenceImage:original,maskImage:mask},token);
+  controller.signal.throwIfAborted();
+  let final=result.imageBlob,delta=0,external=0;
+  if(name!=='text'){
+   const soft=await ImageUtils.featherMask(mask,24),layer=await ImageUtils.inpaintLayer(result.imageBlob,soft,original);
+   const preview=await ImageUtils.compositeLayer(original,layer);
+   await bridge.insertImageAsLayer(await layer.arrayBuffer(),'Auditoria: '+name,info.id,{width:info.width,height:info.height});
+   final=new Blob([await bridge.exportActiveDocumentPNG()],{type:'image/png'});
+   const [a,b,m,p]=await Promise.all([original,final,mask,preview].map(pixels));
+   for(let i=0;i<a.length;i+=4)for(let c=0;c<4;c++){if(m[i+3]===0&&a[i+c]!==b[i+c])external++;delta=Math.max(delta,Math.abs(p[i+c]-b[i+c]));}
+   assert(external===0,'zero diferenças RGBA fora da seleção');assert(delta<=2,'prévia coincide com Photopea (até 2/255)');
+  }
+  const dimensions=await ImageUtils.getImageDimensions(final);
+  assert(dimensions.width===params.width&&dimensions.height===params.height,'dimensões finais corretas');
+  const data=await ImageUtils.blobToDataURL(final);$('result').src=data;$('download').href=data;$('download').hidden=false;
+  const entry={name,technical:'PASS',seconds:Math.round((performance.now()-started)/1000),width:dimensions.width,height:dimensions.height,externalDifferences:external,maxPreviewDifference:delta,prompt,visual:'PENDENTE'};report.push(entry);
+  $('summary').textContent='PASS técnico — revisão visual pendente';log(JSON.stringify(entry,null,2));
+ }catch(e){const entry={name,technical:controller.signal.aborted?'CANCELLED':'FAIL',error:e.message};report.push(entry);log(JSON.stringify(entry));$('summary').textContent=entry.technical+': '+e.message;}
+ finally{controller=null;busy(false);}
+};
+</script></html>

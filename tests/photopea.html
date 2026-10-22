@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="pt-BR"><meta charset="utf-8"><title>Integração real — Photopea</title>
+<style>body{background:#202124;color:#eee;font:16px system-ui;padding:24px}pre{white-space:pre-wrap}iframe{width:960px;height:640px;border:0}img{width:128px;background:#444}</style>
+<h1>Integração com Photopea real</h1><pre id="results">Carregando Photopea…</pre>
+<div id="previews"></div><iframe id="photopea" title="Photopea de teste"></iframe>
+<script type="module">
+import {PhotopeaBridge} from '/src/core/PhotopeaBridge.ts';
+import {ImageUtils} from '/src/services/ImageUtils.ts';
+const iframe=document.getElementById('photopea');
+const output=document.getElementById('results');
+const checks=[];
+window.addEventListener('error',event=>{output.textContent+='\nERROR: '+event.message;});
+window.addEventListener('unhandledrejection',event=>{output.textContent+='\nERROR: '+event.reason;});
+const assert=(value,label)=>{if(!value)throw new Error(label);checks.push('PASS: '+label);output.textContent=checks.join('\n');};
+let started=false;
+window.addEventListener('message', async event=>{
+  if(started || event.source!==iframe.contentWindow || event.origin!=='https://www.photopea.com' || event.data!=='ai-ready')return;
+  started=true;
+  const bridge=PhotopeaBridge.forEmbeddedPhotopea(iframe.contentWindow);
+  try {
+    await bridge.runScript(`var doc=app.documents.add(512,512,72,"AI Integration Test"); var color=new SolidColor();color.rgb.red=80;color.rgb.green=140;color.rgb.blue=180;doc.selection.selectAll();doc.selection.fill(color);doc.selection.select([[160,160],[350,160],[350,350],[160,350]]);`);
+    const info=await bridge.getDocumentInfo();
+    checks.push('Documento: '+JSON.stringify(info));
+    checks.push('Raw: '+await bridge.runScript('try { app.echoToOE(JSON.stringify({width:app.activeDocument.width,height:app.activeDocument.height,source:app.activeDocument.source,bounds:app.activeDocument.selection.bounds})); } catch(e) {app.echoToOE(e.message);}'));
+    assert(info.exists && info.hasSelection && info.width===512,'documento e seleção reconhecidos');
+    const base=await bridge.exportActiveDocumentPNG();
+    assert(base?.byteLength>0,'imagem do documento exportada');
+    const mask=await bridge.exportSelectionMask();
+    assert(mask?.byteLength>0,'máscara da seleção exportada');
+    const bitmap=await createImageBitmap(new Blob([mask],{type:'image/png'}));
+    const canvas=document.createElement('canvas');canvas.width=512;canvas.height=512;
+    const ctx=canvas.getContext('2d');ctx.drawImage(bitmap,0,0);bitmap.close();
+    assert(ctx.getImageData(200,200,1,1).data[3]===255 && ctx.getImageData(20,20,1,1).data[3]===0,'máscara contém apenas a área selecionada');
+    const originalState=JSON.parse(await bridge.runScript('app.echoToOE(JSON.stringify({count:app.activeDocument.layers.length,visible:app.activeDocument.layers[0].visible}));'));
+    assert(originalState.count===1 && originalState.visible,'captura restaura as camadas originais');
+    ctx.clearRect(0,0,512,512);ctx.fillStyle='red';ctx.fillRect(0,0,512,512);
+    const red=await new Promise(resolve=>canvas.toBlob(resolve,'image/png'));
+    const layer=await ImageUtils.inpaintLayer(red,new Blob([mask],{type:'image/png'}));
+    await bridge.insertImageAsLayer(await layer.arrayBuffer(),'AI: teste "seguro"',info.source);
+    const after=await bridge.getDocumentInfo();
+    const state=JSON.parse(await bridge.runScript('app.echoToOE(JSON.stringify({count:app.activeDocument.layers.length,name:app.activeDocument.layers[0].name}));'));
+    assert(after.source===info.source && state.count===2 && state.name==='AI: teste "seguro"','inserção cria uma camada no documento correto e preserva o nome');
+    const merged=await bridge.exportActiveDocumentPNG();
+    const mergedBitmap=await createImageBitmap(new Blob([merged],{type:'image/png'}));
+    ctx.clearRect(0,0,512,512);ctx.drawImage(mergedBitmap,0,0);mergedBitmap.close();
+    const inside=ctx.getImageData(200,200,1,1).data;
+    const outside=ctx.getImageData(20,20,1,1).data;
+    assert(inside[0]===255 && inside[1]===0 && outside[0]===80 && outside[1]===140 && outside[2]===180,'camada fica acima do fundo e mantém os pixels externos');
+    output.textContent+='\n\n7 testes de integração passaram. A camada vermelha é uma fixture sintética, não uma edição de IA.';
+
+  } catch(error){output.textContent=checks.join('\n')+'\nFAIL: '+error.message;}
+});
+iframe.src='https://www.photopea.com/#'+encodeURIComponent(JSON.stringify({script:'app.echoToOE("ai-ready");'}));
+output.textContent='Aguardando inicialização em '+iframe.src;
+
+</script></html>
